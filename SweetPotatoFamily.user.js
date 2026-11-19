@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         番薯大家族
 // @namespace    hans-ro-survivors-tools
-// @version      1.0.0
+// @version      1.0.6
 // @updateURL    https://raw.githubusercontent.com/potato316/sweet-potato-family/main/SweetPotatoFamily.user.js
 // @downloadURL  https://raw.githubusercontent.com/potato316/sweet-potato-family/main/SweetPotatoFamily.user.js
 // @description  v0.8.5 整理設定介面：分類折疊、簡化資訊顯示；保留 v0.8.4.16 自動化功能。
@@ -15,7 +15,7 @@
 (() => {
   'use strict';
 
-  const VERSION = '1.0.0';
+  const VERSION = '1.0.6';
   const PICKUP_KINDS = new Set(['magnet', 'meat', 'chest', 'loot', 'card', 'egg']);
   const pickupArrays = new Set();
   const settings = { enabled: true, utility: true, chest: true, rewards: true };
@@ -1286,7 +1286,7 @@
   'use strict';
   const KEY = 'HANS_AUTO_STAGE_V084';
   const defaults = { enabled:false, stage:'夢羅克金字塔', cycle:1, loop:true,
-    mob:100, damage:100, hp:100, speed:100, events:100, level:1, characterName:'', characterNames:[], discardUnfinished:false };
+    mob:100, damage:100, hp:100, speed:100, events:100, level:1, characterName:'', characterNames:[], discardUnfinished:false, autoClear:false, farmCycle:1, farmStage:'夢羅克金字塔', clearCycle:1, clearStage:'普隆德拉原野' };
   let cfg = {...defaults};
   try { const old=JSON.parse(localStorage.getItem(KEY)||'{}');
     for(const k of Object.keys(defaults)) if(typeof old[k]===typeof defaults[k]) cfg[k]=old[k];
@@ -1314,6 +1314,92 @@
   if(cfg.cycle<1||cfg.cycle>12)cfg.cycle=1;
   // Keep the saved first-chapter stage; switch to a valid stage when moving chapters.
   if(!stagesFor(cfg.cycle).includes(cfg.stage) && (BASE_STAGES.includes(cfg.stage)||CHAPTER2_STAGES.includes(cfg.stage)))cfg.stage=stagesFor(cfg.cycle)[0];
+  // Independent presets: the active cycle/stage are used by the existing game automation.
+  // The farm and clearance selections are saved separately and never overwrite each other.
+  const savedRaw=(()=>{try{return JSON.parse(localStorage.getItem(KEY)||'{}')}catch(_){return {}}})();
+  if(!Object.prototype.hasOwnProperty.call(savedRaw,'farmCycle')){
+    cfg.farmCycle=cfg.autoClear?1:cfg.cycle;
+    cfg.farmStage=cfg.autoClear?'夢羅克金字塔':cfg.stage;
+  }
+  if(!Object.prototype.hasOwnProperty.call(savedRaw,'clearCycle')){
+    cfg.clearCycle=cfg.autoClear?cfg.cycle:1;
+    cfg.clearStage=cfg.autoClear?cfg.stage:'普隆德拉原野';
+  }
+  const validCycle=n=>Number.isInteger(Number(n))&&Number(n)>=1&&Number(n)<=12?Number(n):1;
+  const normalizedStage=(name,cycle)=>{
+    let stage=stripCycle(name);
+    if(stage==='元宵節')stage='元宵燈會';
+    return stagesFor(cycle).includes(stage)?stage:stagesFor(cycle)[0];
+  };
+  cfg.farmCycle=validCycle(cfg.farmCycle);
+  cfg.clearCycle=validCycle(cfg.clearCycle);
+  cfg.farmStage=normalizedStage(cfg.farmStage,cfg.farmCycle);
+  cfg.clearStage=normalizedStage(cfg.clearStage,cfg.clearCycle);
+  cfg.cycle=cfg.autoClear?cfg.clearCycle:cfg.farmCycle;
+  cfg.stage=cfg.autoClear?cfg.clearStage:cfg.farmStage;
+  function saveActiveSelection(){
+    if(cfg.autoClear){cfg.clearCycle=cfg.cycle;cfg.clearStage=cfg.stage;}
+    else{cfg.farmCycle=cfg.cycle;cfg.farmStage=cfg.stage;}
+  }
+  function switchMode(toClear){
+    saveActiveSelection();
+    cfg.autoClear=!!toClear;
+    cfg.cycle=toClear?cfg.clearCycle:cfg.farmCycle;
+    cfg.stage=toClear?cfg.clearStage:cfg.farmStage;
+    cfg.enabled=true;
+    expeditionSince=0;awaitingResult=false;pendingClearStage='';
+    tick._cycleClicked=0;tick._cycleClickedAt=0;
+    tick._selectedStage='';tick._selectedAt=0;tick._scrollTarget='';tick._scrollCount=0;
+    save();syncClearUI();
+  }
+  // Sequential clearance: preserve the chapter/round order and existing stage list.
+  const CLEAR_TIMEOUT=30000;
+  let expeditionSince=0;
+  let awaitingResult=false;
+  let pendingClearStage='';
+  const clearIndex=()=>stagesFor(cfg.cycle).indexOf(cfg.stage);
+  const clearStatus=()=>cfg.autoClear?'自動通關中：'+(chapterOf(cfg.cycle)===1?'第一章':'第二章')+roundOf(cfg.cycle)+'周目 '+cfg.stage:'自動通關已關閉';
+  // When a clearance stage cannot launch, farm the immediately preceding
+  // stage instead. Cross a chapter/round boundary when needed.
+  function previousClearTarget(cycle,stage){
+    const stages=stagesFor(cycle);
+    const index=stages.indexOf(stage);
+    if(index>0)return {cycle,stage:stages[index-1]};
+    if(index===0&&cycle>1){
+      const previousCycle=cycle-1;
+      const previousStages=stagesFor(previousCycle);
+      return {cycle:previousCycle,stage:previousStages[previousStages.length-1]};
+    }
+    // No preceding stage exists (first stage of the first round).
+    return {cycle,stage};
+  }
+  function stopClear(reason,farmPrevious=false){
+    saveActiveSelection();
+    if(farmPrevious){
+      const target=previousClearTarget(cfg.clearCycle,cfg.clearStage);
+      cfg.farmCycle=target.cycle;
+      cfg.farmStage=target.stage;
+      cfg.loop=true; // fallback must continuously farm the chosen stage
+    }
+    cfg.autoClear=false;cfg.enabled=true;awaitingResult=false;pendingClearStage='';expeditionSince=0;
+    cfg.cycle=cfg.farmCycle;cfg.stage=cfg.farmStage;
+    tick._cycleClicked=0;tick._cycleClickedAt=0;
+    tick._selectedStage='';tick._selectedAt=0;tick._scrollTarget='';tick._scrollCount=0;
+    save();syncClearUI();
+    setInfo(reason+'；已切換循環刷關：'+(chapterOf(cfg.cycle)===1?'第一章':'第二章')+roundOf(cfg.cycle)+'周目 '+cfg.stage);
+  }
+  function advanceClear(){
+    let i=clearIndex();
+    if(i<0){stopClear('指定關卡不在目前章節清單');return;}
+    const stages=stagesFor(cfg.cycle);
+    if(i+1<stages.length)cfg.stage=stages[i+1];
+    else if(cfg.cycle<12){cfg.cycle++;cfg.stage=stagesFor(cfg.cycle)[0];}
+    else{stopClear('第一章至第二章六周目全部完成');return;}
+    saveActiveSelection();save();expeditionSince=0;tick._cycleClicked=0;tick._cycleClickedAt=0;
+    tick._selectedStage='';tick._selectedAt=0;tick._scrollTarget='';tick._scrollCount=0;
+    syncClearUI();setInfo('通關成功，下一關：'+clearStatus());
+  }
+  let syncClearUI=()=>{};
   const save=()=>{try{localStorage.setItem(KEY,JSON.stringify(cfg));}catch(_){}};
   let section, info, busyUntil=0, lastStep='', entered=false, returnedAt=0;
   const labels=['敵人數量','敵人傷害','敵人 HP','敵人速度','事件數量','刷關等級'];
@@ -1465,10 +1551,29 @@
       setInfo('偵測到最終關劇情提示，但尚未定位「接受」按鈕');
       return;
     }
-    // The result button appears in both victory and death summaries.
+    // Both modes use the SAME result-screen return flow. Only auto-clear
+    // changes the next target after a confirmed successful expedition.
     const back=b.find(e=>/(?:返回角色|回到角色)/.test(text(e)));
-    if(back){if(!cfg.loop&&entered){cfg.enabled=false;save();section.querySelector('[data-auto="enabled"]').checked=false;setInfo('單次模式：本場結束，已停止');return;}
-      if(press(back,'結算返回角色')){returnedAt=now;entered=false;busyUntil=now+3500;}return;}
+    if(back){
+      let advanceAfterReturn=false;
+      if(cfg.autoClear){
+        const resultRoot=parentPanel(back);
+        // The game's actual result screen may say "你活下來了！" rather
+        // than the generic "勝利/通關成功" labels.
+        const resultText=text(resultRoot).slice(0,4000);
+        const won=/(?:你活下來了|通關成功|挑戰成功|勝利|通關完成|關卡完成|遠征成功|VICTORY|STAGE\s*CLEAR)/i.test(resultText);
+        const lost=/(?:你死了|你陣亡了|挑戰失敗|通關失敗|戰敗|死亡|陣亡|GAME\s*OVER|DEFEAT)/i.test(resultText);
+        if(won&&!lost){advanceAfterReturn=true;setInfo('本關已完成，返回角色後將前往下一關');}
+        else if(lost){setInfo('本關失敗，返回角色後重試原關卡');}
+        else{setInfo('結算結果尚未辨識；先返回角色，不跳過目前關卡');}
+      }
+      if(!cfg.loop&&!cfg.autoClear&&entered){cfg.enabled=false;save();setInfo('單次模式：本場結束，已停止');return;}
+      if(press(back,'結算返回角色')){
+        returnedAt=now;entered=false;busyUntil=now+3500;
+        if(cfg.autoClear&&advanceAfterReturn)advanceClear();
+      }
+      return;
+    }
     // Select the renamed offline lobby button; never join an online lobby.
     const offline=b.find(e=>/^離線玩$/.test(text(e)));
     if(offline){press(offline,'選擇離線玩');busyUntil=now+2800;return;}
@@ -1501,10 +1606,11 @@
     // Difficulty window: set sliders first, only then depart.
     const go=b.find(e=>/前往野外/.test(text(e)));
     if(go){const root=parentPanel(go);if(!applyDifficulty(root))return;
-      if(press(go,'設定六項難度並前往野外')){entered=true;busyUntil=now+650;}return;}
+      if(press(go,'設定六項難度並前往野外')){entered=true;expeditionSince=0;busyUntil=now+650;}return;}
     // Expedition: select the actual left-hand stage row, scrolling the list if needed.
     const depart=b.find(e=>/^出發$/.test(text(e)));
     if(depart){
+      if(cfg.autoClear){if(!expeditionSince)expeditionSince=now; if(now-expeditionSince>=CLEAR_TIMEOUT){stopClear('遠征畫面停留超過30秒，可能尚未解鎖或無法進入',true);return;}}
       const target=norm(stageForCycle(cfg.stage,cfg.cycle));
       if(!target){setInfo('請先選擇指定關卡');return;}
       let root=depart.parentElement;
@@ -1605,6 +1711,7 @@
       setInfo('出發等待確認：指定「'+target+'」；右側辨識='+(rightBanner?'是':'否')+'，左側辨識='+(leftTitle?'是':'否')+'，周目='+cfg.cycle+'。請回報此文字');
       return;
     }
+    if(cfg.autoClear)expeditionSince=0;
     // Main city: only use Space when the renamed ship captain prompt is visible.
     if(now-returnedAt<3000)return;
     const prompt=[...document.querySelectorAll('button,span,div')].filter(shown).find(e=>{
@@ -1622,17 +1729,24 @@
   function mount(){
     const host=document.querySelector('#hans-auto-loot-panel .hal-body');if(!host||section)return;
     section=document.createElement('details');section.className='hac-group';section.id='hans-auto-stage-v084';
-    section.innerHTML=`<summary>自動選關／循環進關（v0.8.5.3）</summary><div class="has-body">
+    section.innerHTML=`<summary>自動選關與通關設定</summary><div class="has-body">
       <div class="has-subtitle">自動登入角色（跟隨自動選關開關）</div>
       <label>指定登入角色<select data-auto="characterName"><option value="">請先讀取角色姓名</option></select></label>
       <button type="button" data-read-characters>重新讀取角色姓名</button>
-      <div class="has-subtitle">自動選關</div>
+      <details class="has-mode-fold" id="has-farm-fold"><summary>🗺️ 循環刷關（固定關卡循環）</summary><div class="has-mode-body">
       <button type="button" class="has-stage-toggle off" data-stage-toggle aria-pressed="false">已暫停</button>
-      <label><input type="checkbox" id="hans-auto-battle-2x"> 進入關卡自動切換 2x 速度</label>
-      <label>章節／周目<select data-auto="cycle"><option value="1">第一章一周目</option><option value="2">第一章二周目</option><option value="3">第一章三周目</option><option value="4">第一章四周目</option><option value="5">第一章五周目</option><option value="6">第一章六周目</option><option value="7">第二章一周目</option><option value="8">第二章二周目</option><option value="9">第二章三周目</option><option value="10">第二章四周目</option><option value="11">第二章五周目</option><option value="12">第二章六周目</option></select></label>
-      <label>指定關卡<select data-auto="stage"></select></label>
+      <label>刷關章節／周目<select data-auto="cycle"><option value="1">第一章一周目</option><option value="2">第一章二周目</option><option value="3">第一章三周目</option><option value="4">第一章四周目</option><option value="5">第一章五周目</option><option value="6">第一章六周目</option><option value="7">第二章一周目</option><option value="8">第二章二周目</option><option value="9">第二章三周目</option><option value="10">第二章四周目</option><option value="11">第二章五周目</option><option value="12">第二章六周目</option></select></label>
+      <label>刷關指定關卡<select data-auto="stage"></select></label>
       <label data-custom-stage-wrap style="display:none">自訂關卡名稱<input data-custom-stage type="text" placeholder="輸入該周目的完整關卡名稱"></label>
       <label><input type="checkbox" data-auto="loop"> 死亡／通關後持續循環</label>
+      </div></details>
+      <details class="has-mode-fold" id="has-clear-fold"><summary>🏁 自動通關（逐關推進）</summary><div class="has-mode-body">
+      <button type="button" class="has-stage-toggle off" data-clear-toggle aria-pressed="false">已暫停</button>
+      <label>通關起始章節／周目<select data-clear-cycle></select></label>
+      <label>通關起始指定關卡<select data-clear-stage></select></label>
+      <p class="hal-note">從指定關卡開始依序通關至第二章六周目；遠征畫面停留30秒無法繼續時，自動關閉通關並切換到上一關循環刷關。兩種模式不會同時執行。</p>
+      </div></details>
+      <label><input type="checkbox" id="hans-auto-battle-2x"> 進入關卡自動切換 2x 速度</label>
       <div class="has-subtitle">六項難度（100%～2000%，等級 1～20）</div>
       ${keys.map((k,i)=>`<label>${labels[i]}<input type="number" data-auto="${k}" min="${i===5?1:100}" max="${i===5?20:2000}" step="${i===5?1:100}"></label>`).join('')}
       <div class="has-actions"><button type="button" data-preset="min">全部最低</button><button type="button" data-preset="max">全部最高</button></div>
@@ -1644,6 +1758,11 @@
       #hans-auto-stage-v084{border-top:1px solid rgba(255,255,255,.18);padding-top:8px}
       #hans-auto-stage-v084>summary{cursor:pointer;font-size:12px;font-weight:700;color:#f2d9a8}
       #hans-auto-stage-v084 .has-body{display:grid;gap:8px;padding-top:8px}
+      #hans-auto-stage-v084 .has-mode-fold{border:1px solid rgba(255,255,255,.18);border-radius:6px;padding:7px;background:rgba(255,255,255,.035)}
+      #hans-auto-stage-v084 .has-mode-fold>summary{cursor:pointer;font-size:12px;font-weight:700;color:#f2d9a8;list-style:revert}
+      #hans-auto-stage-v084 .has-mode-body{display:grid;gap:8px;padding-top:9px}
+      #hans-auto-stage-v084 .has-mode-body>label{display:grid;gap:3px;font-size:11px}
+      #hans-auto-stage-v084 .has-mode-body>label:has(input[type=checkbox]){display:flex;align-items:center;gap:6px}
       #hans-auto-stage-v084 .has-stage-toggle{width:100%;background:#8b4646;color:#fff;font-weight:700;padding:7px 9px}
       #hans-auto-stage-v084 .has-stage-toggle:not(.off){background:#347b50}
       #hans-auto-stage-v084 .has-body>label{display:grid;gap:3px;font-size:11px}
@@ -1671,45 +1790,89 @@
     }
     section.querySelector('[data-read-characters]').addEventListener('click',readCharacterNames);
     const stageSelect=section.querySelector('[data-auto="stage"]');
+    const cycleSelect=section.querySelector('[data-auto="cycle"]');
     const customWrap=section.querySelector('[data-custom-stage-wrap]');
     const customInput=section.querySelector('[data-custom-stage]');
-    function syncStageSelection(){
-      const isCustom=!stagesFor(cfg.cycle).includes(cfg.stage);
-      const selected=isCustom?'__custom__':cfg.stage;
-      stageSelect.replaceChildren();
-      for(const base of stagesFor(cfg.cycle)){
-        const opt=document.createElement('option');opt.value=base;
-        opt.textContent=stageForCycle(base,cfg.cycle);
-        stageSelect.appendChild(opt);
-      }
-      const other=document.createElement('option');other.value='__custom__';
-      other.textContent='其他關卡（手動輸入）';stageSelect.appendChild(other);
-      stageSelect.value=selected;
-      customWrap.style.display=isCustom?'grid':'none';
-      customInput.value=isCustom?cfg.stage:'';
-    }
-    syncStageSelection();
-    readCharacterNames();
+    const clearCycleSelect=section.querySelector('[data-clear-cycle]');
+    const clearStageSelect=section.querySelector('[data-clear-stage]');
     const stageToggle=section.querySelector('[data-stage-toggle]');
+    const clearToggle=section.querySelector('[data-clear-toggle]');
+    const cycles=[...cycleSelect.options].map(o=>({value:o.value,label:o.textContent}));
+    for(const entry of cycles){const o=document.createElement('option');o.value=entry.value;o.textContent=entry.label;clearCycleSelect.appendChild(o);}
+    function fillStages(select,cycle,selected,allowCustom){
+      select.replaceChildren();
+      for(const base of stagesFor(cycle)){
+        const opt=document.createElement('option');opt.value=base;
+        opt.textContent=stageForCycle(base,cycle);select.appendChild(opt);
+      }
+      if(allowCustom){const other=document.createElement('option');other.value='__custom__';other.textContent='其他關卡（手動輸入）';select.appendChild(other);}
+      select.value=allowCustom&&!stagesFor(cycle).includes(selected)?'__custom__':selected;
+    }
+    function syncStageSelection(){
+      fillStages(stageSelect,cfg.farmCycle,cfg.farmStage,true);
+      const custom=!stagesFor(cfg.farmCycle).includes(cfg.farmStage);
+      customWrap.style.display=custom?'grid':'none';customInput.value=custom?cfg.farmStage:'';
+      cycleSelect.value=String(cfg.farmCycle);
+      clearCycleSelect.value=String(cfg.clearCycle);
+      fillStages(clearStageSelect,cfg.clearCycle,cfg.clearStage,false);
+    }
     const updateStageToggle=()=>{
-      stageToggle.textContent=cfg.enabled?'已啟用':'已暫停';
-      stageToggle.classList.toggle('off',!cfg.enabled);
-      stageToggle.setAttribute('aria-pressed',String(cfg.enabled));
+      const farmOn=cfg.enabled&&!cfg.autoClear,clearOn=cfg.enabled&&cfg.autoClear;
+      stageToggle.textContent=farmOn?'已啟用':'已暫停';
+      stageToggle.classList.toggle('off',!farmOn);
+      stageToggle.setAttribute('aria-pressed',String(farmOn));
+      clearToggle.textContent=clearOn?'已啟用':'已暫停';
+      clearToggle.classList.toggle('off',!clearOn);
+      clearToggle.setAttribute('aria-pressed',String(clearOn));
     };
-    updateStageToggle();
+    syncClearUI=()=>{syncStageSelection();updateStageToggle();};
+    syncClearUI();readCharacterNames();
+    function resetAfterChange(){busyUntil=0;tick._cycleClicked=0;tick._cycleClickedAt=0;tick._selectedStage='';tick._selectedAt=0;tick._scrollTarget='';tick._scrollCount=0;}
     stageToggle.addEventListener('click',()=>{
-      cfg.enabled=!cfg.enabled;
-      save();updateStageToggle();busyUntil=0;
-      tick._selectedStage='';tick._selectedAt=0;
-      tick._scrollTarget='';tick._scrollCount=0;
-      setInfo(cfg.enabled?'自動選關及自動登入已啟用，等待畫面…':'自動選關及自動登入已暫停。');
+      if(cfg.enabled&&!cfg.autoClear){cfg.enabled=false;save();}
+      else switchMode(false);
+      resetAfterChange();syncClearUI();setInfo(cfg.enabled?'循環刷關已啟用':'循環刷關已暫停');
+    });
+    clearToggle.addEventListener('click',()=>{
+      if(cfg.enabled&&cfg.autoClear){saveActiveSelection();cfg.enabled=false;cfg.autoClear=false;cfg.cycle=cfg.farmCycle;cfg.stage=cfg.farmStage;save();}
+      else switchMode(true);
+      resetAfterChange();syncClearUI();setInfo(cfg.enabled?'自動通關已啟用：'+clearStatus():'自動通關已暫停');
+    });
+    cycleSelect.addEventListener('change',()=>{
+      cfg.farmCycle=Number(cycleSelect.value);
+      cfg.farmStage=normalizedStage(cfg.farmStage,cfg.farmCycle);
+      if(!cfg.autoClear){cfg.cycle=cfg.farmCycle;cfg.stage=cfg.farmStage;}
+      save();resetAfterChange();syncClearUI();setInfo('已設定刷關章節／周目');
+    });
+    stageSelect.addEventListener('change',()=>{
+      cfg.farmStage=stageSelect.value==='__custom__'?customInput.value.trim():stageSelect.value;
+      if(!cfg.autoClear)cfg.stage=cfg.farmStage;
+      save();resetAfterChange();syncClearUI();setInfo('已設定刷關關卡：'+cfg.farmStage);
     });
     customInput.addEventListener('change',()=>{
-      cfg.stage=customInput.value.trim();save();busyUntil=0;
-      setInfo('自訂關卡已儲存：'+cfg.stage);
+      cfg.farmStage=customInput.value.trim();if(!cfg.autoClear)cfg.stage=cfg.farmStage;
+      save();resetAfterChange();setInfo('自訂刷關關卡已儲存：'+cfg.farmStage);
     });
-    section.querySelectorAll('[data-auto]').forEach(el=>{const k=el.dataset.auto;el.type==='checkbox'?el.checked=cfg[k]:(k==='stage'?syncStageSelection():el.value=cfg[k]);
-      el.addEventListener('change',()=>{if(k==='stage'){if(el.value==='__custom__'){customWrap.style.display='grid';cfg.stage=customInput.value.trim();}else{cfg.stage=el.value;customWrap.style.display='none';}}else{cfg[k]=el.type==='checkbox'?el.checked:(typeof defaults[k]==='number'?Number(el.value):el.value);if(k==='cycle'){if(!stagesFor(cfg.cycle).includes(cfg.stage)&&(BASE_STAGES.includes(cfg.stage)||CHAPTER2_STAGES.includes(cfg.stage)))cfg.stage=stagesFor(cfg.cycle)[0];syncStageSelection();tick._cycleClicked=0;tick._cycleClickedAt=0;}}save();busyUntil=0;tick._selectedStage='';tick._selectedAt=0;tick._scrollTarget='';tick._scrollCount=0;setInfo('設定已儲存'+(cfg.enabled?'，等待畫面…':'，自動選關已關閉'));});});
+    clearCycleSelect.addEventListener('change',()=>{
+      cfg.clearCycle=Number(clearCycleSelect.value);
+      cfg.clearStage=normalizedStage(cfg.clearStage,cfg.clearCycle);
+      if(cfg.autoClear){cfg.cycle=cfg.clearCycle;cfg.stage=cfg.clearStage;expeditionSince=0;}
+      save();resetAfterChange();syncClearUI();setInfo('已設定通關起始周目');
+    });
+    clearStageSelect.addEventListener('change',()=>{
+      cfg.clearStage=clearStageSelect.value;
+      if(cfg.autoClear){cfg.stage=cfg.clearStage;expeditionSince=0;}
+      save();resetAfterChange();syncClearUI();setInfo('已設定通關起始關卡：'+cfg.clearStage);
+    });
+    section.querySelectorAll('[data-auto]').forEach(el=>{
+      const k=el.dataset.auto;
+      if(k==='cycle'||k==='stage')return;
+      if(el.type==='checkbox')el.checked=cfg[k];else el.value=cfg[k];
+      el.addEventListener('change',()=>{
+        cfg[k]=el.type==='checkbox'?el.checked:(typeof defaults[k]==='number'?Number(el.value):el.value);
+        save();resetAfterChange();setInfo('設定已儲存');
+      });
+    });
     section.querySelectorAll('[data-preset]').forEach(el=>el.addEventListener('click',()=>{
       const max=el.dataset.preset==='max';keys.forEach((k,i)=>{cfg[k]=max?(i===5?20:2000):(i===5?1:100);section.querySelector(`[data-auto="${k}"]`).value=cfg[k];});save();setInfo(max?'六項難度已設為最大':'六項難度已設為最低');}));
   }
