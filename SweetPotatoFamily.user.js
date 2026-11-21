@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         番薯大家族
 // @namespace    hans-ro-survivors-tools
-// @version      1.0.6
+// @version      1.0.7
 // @updateURL    https://raw.githubusercontent.com/potato316/sweet-potato-family/main/SweetPotatoFamily.user.js
 // @downloadURL  https://raw.githubusercontent.com/potato316/sweet-potato-family/main/SweetPotatoFamily.user.js
 // @description  v0.8.5 整理設定介面：分類折疊、簡化資訊顯示；保留 v0.8.4.16 自動化功能。
@@ -15,7 +15,7 @@
 (() => {
   'use strict';
 
-  const VERSION = '1.0.6';
+  const VERSION = '1.0.7';
   const PICKUP_KINDS = new Set(['magnet', 'meat', 'chest', 'loot', 'card', 'egg']);
   const pickupArrays = new Set();
   const settings = { enabled: true, utility: true, chest: true, rewards: true };
@@ -1992,7 +1992,17 @@
     #hans-auto-loot-panel .hac-section{border-top:0;padding-top:0;margin:0}
     #hans-auto-loot-panel #hans-auto-stage-v084{margin-top:2px}
   `;
-  (document.head || document.documentElement).appendChild(css);
+  // At document-start, both document.head and document.documentElement may be null.
+  // Defer only the stylesheet mount; keep early game hooks running immediately.
+  function mountLayoutCss() {
+    const root = document.head || document.documentElement;
+    if (!root) return false;
+    if (!css.isConnected) root.appendChild(css);
+    return true;
+  }
+  if (!mountLayoutCss()) {
+    document.addEventListener('DOMContentLoaded', mountLayoutCss, { once: true });
+  }
   // Keep mouse-wheel scrolling inside the settings panel instead of letting
   // the game canvas / document consume the wheel input.
   function protectPanelWheel() {
