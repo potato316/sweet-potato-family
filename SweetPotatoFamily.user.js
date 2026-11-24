@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         番薯大家族
 // @namespace    hans-ro-survivors-tools
-// @version      1.0.7
+// @version      1.0.9
 // @updateURL    https://raw.githubusercontent.com/potato316/sweet-potato-family/main/SweetPotatoFamily.user.js
 // @downloadURL  https://raw.githubusercontent.com/potato316/sweet-potato-family/main/SweetPotatoFamily.user.js
 // @description  v0.8.5 整理設定介面：分類折疊、簡化資訊顯示；保留 v0.8.4.16 自動化功能。
@@ -15,7 +15,7 @@
 (() => {
   'use strict';
 
-  const VERSION = '1.0.7';
+  const VERSION = '1.0.9';
   const PICKUP_KINDS = new Set(['magnet', 'meat', 'chest', 'loot', 'card', 'egg']);
   const pickupArrays = new Set();
   const settings = { enabled: true, utility: true, chest: true, rewards: true };
@@ -581,7 +581,8 @@
     banishEnabled: false,
     banishKeywords: '',
     specialEnabled: false,
-    specialSkills: ['', '', '', '', '', '']
+    specialSkills: ['', '', '', '', '', ''],
+    specialCounts: [1, 1, 1, 1, 1, 1]
   };
   const state = {
     ...defaults,
@@ -611,6 +612,8 @@
       for (const key of Object.keys(defaults)) {
         if (key === 'specialSkills' && Array.isArray(saved[key])) {
           state[key] = Array.from({length: 6}, (_, i) => typeof saved[key][i] === 'string' ? saved[key][i] : '');
+        } else if (key === 'specialCounts') {
+          state[key] = Array.from({length: 6}, (_, i) => Math.min(999, Math.max(1, Math.floor(Number(saved[key]?.[i]) || 1))));
         } else if (typeof saved[key] === typeof defaults[key]) state[key] = saved[key];
       }
     } catch (_) { /* Use defaults when storage is unavailable or invalid. */ }
@@ -699,6 +702,7 @@
       if (!needle) continue;
       const found = labels.findIndex((label, index) =>
         label.includes(needle) &&
+        !isProtectedSpecial(cards[index]) &&
         !state.banishedLabels.has(normalize(
           (cards[index].querySelector('.pk-name')?.textContent || cardLabel(cards[index])).trim()
         ))
@@ -892,12 +896,17 @@
 
   // Each configured skill has its own one-time select -> banish -> done lifecycle.
   // Exact normalized name matching avoids accidental substring matches.
+  function isProtectedSpecial(card) {
+    const name = normalize(card.querySelector('.pk-name')?.textContent || '');
+    return state.specialEnabled && !!name && state.specialSkills.some(value => normalize(value) === name);
+  }
+
   function specialMatch(cards) {
     if (!state.specialEnabled) return null;
     const configured = state.specialSkills.map((name, slot) => ({name: normalize(name), slot})).filter(x => x.name);
     for (const {name, slot} of configured) {
       if (configured.some(x => x.name === name && x.slot < slot)) continue;
-      if ((state.specialStages.get(slot) || 0) >= 2) continue;
+      if (state.specialStages.get(slot) === -1) continue;
       const index = cards.findIndex(card => normalize(card.querySelector('.pk-name')?.textContent || '') === name);
       if (index >= 0) return {index, slot, name};
     }
@@ -905,52 +914,64 @@
   }
 
   async function performSpecial(kind, match, signature, label) {
-    if (state.busy || kind !== 'skill') return;
+    if (state.busy || !['skill', 'chest'].includes(kind)) return;
     state.busy = true;
     state.lastDecision = signature;
     const stage = state.specialStages.get(match.slot) || 0;
     try {
       await wait(420 + document.querySelectorAll('#pk-cards .pk-card').length * 120 + 180);
       const current = getPicker();
-      if (!current || classifyPicker(current.picker) !== 'skill' ||
+      if (!current || classifyPicker(current.picker) !== kind ||
           state.lastDecision !== signature ||
           normalize(current.cards[match.index]?.querySelector('.pk-name')?.textContent || '') !== match.name) {
-        setStatus('指定技能選單已變更，這次不操作。');
+        setStatus('指定技能／寶箱道具選單已變更，這次不操作。');
         return;
       }
-      if (stage === 0) {
+      if (stage < state.specialCounts[match.slot]) {
         current.cards[match.index].click();
         // Do not count a selection merely because the click handler was invoked.
         // A closed picker indicates the game accepted the selection.
+        await wait(260);
+        if (kind === 'chest') {
+          const latest = getPicker();
+          const slot = latest?.picker.querySelectorAll('#pk-cards .pk-slot')[match.index];
+          if (latest && classifyPicker(latest.picker) === kind &&
+              normalize(latest.cards[match.index]?.querySelector('.pk-name')?.textContent || '') === match.name &&
+              slot?.classList.contains('asking')) {
+            const yes = slot.querySelector('[data-yes]');
+            if (!yes || !visible(yes)) { setStatus('指定寶箱道具等待手動確認替換，未累計。'); return; }
+            yes.click();
+          }
+        }
         await wait(420);
         const afterClick = getPicker();
         const afterSignature = afterClick ? `${classifyPicker(afterClick.picker)}|${document.getElementById('pk-title')?.textContent || ''}|${afterClick.cards.map(cardLabel).join('|')}` : '';
         if (!afterClick || afterSignature !== signature) {
           // The game may open the next level-up picker without an observable closed frame.
-          state.specialStages.set(match.slot, 1);
+          state.specialStages.set(match.slot, stage + 1);
           state.specialPending = null;
-          setStatus(`指定技能「${label}」第一次已選擇；下次出現時放逐。`);
+          setStatus(`指定技能／寶箱道具「${label}」已選擇 ${stage + 1}/${state.specialCounts[match.slot]} 次；達標後下次出現時放逐。`);
         } else {
           // Keep the first-click confirmation pending, but do not freeze automation forever.
           state.specialPending = {slot: match.slot, name: match.name, signature};
           state.specialPendingAt = Date.now();
-          setStatus(`已點選「${label}」，等待選單更新後記錄第一次選擇。`);
+          setStatus(`已點選「${label}」，等待選單更新後累計選擇次數。`);
         }
       } else {
         const control = findBanishControl(current.cards[match.index]);
         if (!control) {
-          setStatus(`指定技能「${label}」找不到卡片下方放逐按鈕，未執行放逐。`);
+          setStatus(`指定技能／寶箱道具「${label}」找不到卡片下方放逐按鈕，未執行放逐。`);
           return;
         }
         control.click();
-        state.specialStages.set(match.slot, 2);
+        state.specialStages.set(match.slot, -1);
         state.banishedLabels.add(normalize(label));
-        setStatus(`指定技能「${label}」第二次已送出放逐；此欄位本局不再執行。`);
+        setStatus(`指定技能／寶箱道具「${label}」達指定次數後已送出放逐；此欄位本局不再執行。`);
         await wait(700);
       }
     } catch (error) {
       console.warn('[HANS special skill]', error);
-      setStatus('指定技能操作失敗，請手動處理。');
+      setStatus('指定技能／寶箱道具操作失敗，請手動處理。');
     } finally {
       state.busy = false;
       state.lastSignature = '';
@@ -1006,12 +1027,12 @@
     if (state.busy) return;
     if (state.specialPending) {
       if (!current) {
-        state.specialStages.set(state.specialPending.slot, 1);
+        state.specialStages.set(state.specialPending.slot, (state.specialStages.get(state.specialPending.slot) || 0) + 1);
         state.specialPending = null;
       } else {
         const pendingSignature = `${classifyPicker(current.picker)}|${document.getElementById('pk-title')?.textContent || ''}|${current.cards.map(cardLabel).join('|')}`;
         if (pendingSignature !== state.specialPending.signature) {
-          state.specialStages.set(state.specialPending.slot, 1);
+          state.specialStages.set(state.specialPending.slot, (state.specialStages.get(state.specialPending.slot) || 0) + 1);
           state.specialPending = null;
           state.lastSignature = '';
         } else if (Date.now() - state.specialPendingAt > 2500) {
@@ -1019,7 +1040,7 @@
           // Release the lock and retry the first selection only when cards change.
           state.specialPending = null;
           state.lastSignature = pendingSignature;
-          setStatus('指定技能點擊後選單未變更；暫停重複點擊，請確認遊戲是否接受選擇。');
+          setStatus('指定技能／寶箱道具點擊後選單未變更；暫停重複點擊，請確認遊戲是否接受選擇。');
         } else return;
       }
     }
@@ -1062,7 +1083,7 @@
     if (signature === state.lastSignature || signature === state.lastDecision) return;
 
     // Special skills have absolute priority over ordinary selection and keyword banish.
-    if (kind === 'skill') {
+    {
       const match = specialMatch(current.cards);
       if (match) {
         const label = current.cards[match.index].querySelector('.pk-name')?.textContent?.trim() || labels[match.index];
@@ -1145,8 +1166,9 @@
             <textarea data-choice="banishKeywords" rows="3" placeholder="例如：不需要的技能、低優先技能"></textarea>
           </label>
           <div class="hac-special-body">
-              <label class="hac-special-toggle"><input type="checkbox" data-choice="specialEnabled"> 啟用指定技能規則</label>
-              ${Array.from({length: 6}, (_, i) => `<label>技能 ${i + 1}<input type="text" data-special-slot="${i}" placeholder="輸入一個完整技能名稱"></label>`).join('')}
+              <label class="hac-special-toggle"><input type="checkbox" data-choice="specialEnabled"> 啟用指定技能／寶箱道具規則</label>
+              <div class="hac-special-help"><strong>📖 使用說明</strong><br>輸入完整技能或寶箱道具名稱，設定選取次數（1～999，預設 1）。<br>例如設定 200 次：選滿 200 次後，第 201 次出現時自動放逐，不再選取。<br>六格各自累計，每局重新計算。<br>指定名稱優先於 Keyword 放逐；未達次數時不會被 Keyword 放逐。技能與寶箱共用六格。</div>
+              ${Array.from({length: 6}, (_, i) => `<label>指定 ${i + 1}<span style="display:flex;gap:5px;align-items:center"><input style="flex:1;min-width:0" type="text" data-special-slot="${i}" placeholder="輸入完整技能或道具名稱"><select aria-label="指定 ${i + 1} 選擇次數" data-special-count="${i}" style="width:72px;background:#171b24;color:#fff;border:1px solid #596174;border-radius:4px">${Array.from({length:999},(_,j)=>`<option value="${j+1}">${j+1} 次</option>`).join('')}</select></span></label>`).join('')}
           </div>
           <div class="hac-status">尚未啟用自動選擇／放逐。</div>
         </div>
@@ -1156,6 +1178,8 @@
     style.textContent = `
       #hans-auto-loot-panel .hac-group{border-top:1px solid rgba(255,255,255,.15);padding:7px 0 3px;margin-top:2px}
       #hans-auto-loot-panel .hac-group>summary{cursor:pointer;font-weight:700;color:#f2d9a8;font-size:12px;outline:none}
+      #hans-auto-loot-panel .hac-special-help{border:1px solid #485363;border-radius:5px;padding:6px;color:#cbd5e1;font-size:11px;line-height:1.6;overflow-wrap:anywhere}
+      #hans-auto-loot-panel .hac-special-help strong{color:#f2d9a8}
       #hans-auto-loot-panel .hac-special-body{display:grid;gap:5px;padding:6px 0}
       #hans-auto-loot-panel .hac-special-body label{display:grid;gap:3px;font-size:11px}
       #hans-auto-loot-panel .hac-special-body label.hac-special-toggle{display:flex;align-items:center;justify-content:flex-start;gap:7px;font-size:12px;cursor:pointer;padding:0;margin:0}
@@ -1201,6 +1225,16 @@
       });
     });
 
+    section.querySelectorAll('[data-special-count]').forEach(input => {
+      const slot = Number(input.dataset.specialCount);
+      input.value = String(state.specialCounts[slot]);
+      input.addEventListener('change', () => {
+        state.specialCounts[slot] = Math.min(999, Math.max(1, Number(input.value) || 1));
+        saveSettings();
+        state.lastSignature = '';
+      });
+    });
+
     setStatus(state.banishEnabled
       ? '放逐設定已載入；等待符合關鍵字的技能／寶箱卡片。'
       : (state.skillEnabled || state.chestEnabled
@@ -1228,7 +1262,7 @@
     state.stopFlipHandled = false;
     state.lastObservedLevel = 0;
     state.lastOpenAt = 0;
-    setStatus('本局指定技能／放逐進度已重置；偏好設定保留。');
+    setStatus('本局指定技能／寶箱道具／放逐進度已重置；偏好設定保留。');
   }
   // A fresh expedition is a new run even when the prior result-screen
   // button was missed (e.g. navigation/reload). Reset only on the actual
@@ -1992,17 +2026,7 @@
     #hans-auto-loot-panel .hac-section{border-top:0;padding-top:0;margin:0}
     #hans-auto-loot-panel #hans-auto-stage-v084{margin-top:2px}
   `;
-  // At document-start, both document.head and document.documentElement may be null.
-  // Defer only the stylesheet mount; keep early game hooks running immediately.
-  function mountLayoutCss() {
-    const root = document.head || document.documentElement;
-    if (!root) return false;
-    if (!css.isConnected) root.appendChild(css);
-    return true;
-  }
-  if (!mountLayoutCss()) {
-    document.addEventListener('DOMContentLoaded', mountLayoutCss, { once: true });
-  }
+  (document.head || document.documentElement).appendChild(css);
   // Keep mouse-wheel scrolling inside the settings panel instead of letting
   // the game canvas / document consume the wheel input.
   function protectPanelWheel() {
